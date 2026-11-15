@@ -1,0 +1,89 @@
+set(ENV{PATH} "$ENV{PATH}:/usr/local/bin/:/opt/homebrew/bin") # add brew command into PATH
+target_include_directories(${GOLDENDICT} PRIVATE /usr/local/include /opt/homebrew/include)
+
+find_library(CARBON_LIBRARY Carbon REQUIRED) # for accessibility API
+find_library(APPKIT_LIBRARY AppKit REQUIRED) # for Dock and application activation policy
+target_link_libraries(${GOLDENDICT} PRIVATE ${CARBON_LIBRARY} ${APPKIT_LIBRARY})
+
+find_package(PkgConfig REQUIRED)
+
+set(Optional_Pkgs "")
+if (WITH_ZIM)
+    list(APPEND Optional_Pkgs "libzim")
+endif ()
+if (WITH_FFMPEG_PLAYER)
+    list(APPEND Optional_Pkgs "libavcodec;libavformat;libavutil;libswresample")
+    list(APPEND Optional_Pkgs "libsharpyuv;libwebp;libjxl_cms") # transitive dependencies that macdeployqt cannot find.
+endif ()
+
+if (WITH_ZIM)
+    # ICU from homebrew is "key-only", we need to manually prioritize it -> see `brew info icu4c`
+    # And we needs to find the correct one if multiple versions co exists.
+    execute_process(
+            COMMAND sh -c [=[brew --prefix $(brew deps libzim | grep icu4c)]=]
+            OUTPUT_VARIABLE ICU_REQUIRED_BY_ZIM_PREFIX
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            COMMAND_ERROR_IS_FATAL ANY)
+    message(STATUS "Found correct homebrew icu path -> ${ICU_REQUIRED_BY_ZIM_PREFIX}")
+    set(ENV{PKG_CONFIG_PATH} "$ENV{PKG_CONFIG_PATH}:${ICU_REQUIRED_BY_ZIM_PREFIX}/lib/pkgconfig")
+    message(STATUS "Updated pkg_config_path -> $ENV{PKG_CONFIG_PATH}")
+
+    # icu4c as a transitive dependency of libzim may not be automatically copied
+    # into the app bundle. Keep these as a CMake list; Package_macOS.cmake copies
+    # them into the bundle before allowing macdeployqt to rewrite install names.
+    set(BREW_ICU_ADDITIONAL_DYLIBS
+            "${ICU_REQUIRED_BY_ZIM_PREFIX}/lib/libicudata.dylib"
+            "${ICU_REQUIRED_BY_ZIM_PREFIX}/lib/libicui18n.dylib"
+            "${ICU_REQUIRED_BY_ZIM_PREFIX}/lib/libicuuc.dylib")
+    message(STATUS "Additional ICU `.dylib`s -> ${BREW_ICU_ADDITIONAL_DYLIBS}")
+endif ()
+
+pkg_check_modules(DEPS REQUIRED IMPORTED_TARGET
+        hunspell
+        liblzma
+        lzo2
+        opencc
+        tomlplusplus
+        vorbis # .ogg
+        vorbisfile
+        xapian-core
+        zlib
+        ${Optional_Pkgs}
+)
+
+find_package(Iconv REQUIRED)
+find_package(BZip2 REQUIRED)
+find_package(fmt REQUIRED)
+target_link_libraries(${GOLDENDICT} PRIVATE PkgConfig::DEPS BZip2::BZip2 Iconv::Iconv fmt::fmt)
+
+if (WITH_EPWING_SUPPORT)
+    # Use the bundled eb source (CMake build, no autotools) instead of a
+    # system/brew-installed libeb. This avoids the autoconf/libtool version
+    # mismatch failures on recent macOS runners and keeps the eb version in
+    # sync with the Windows build.
+    add_subdirectory(thirdparty/eb EXCLUDE_FROM_ALL)
+    target_include_directories(${GOLDENDICT} PRIVATE
+            thirdparty
+            )
+    target_link_libraries(${GOLDENDICT} PRIVATE eb)
+
+    # `thirdparty/eb` is upstream C code from the autotools era: it mixes
+    # `char` and `unsigned char` pointers and uses old-style function
+    # definitions without prototypes. Clang warns about both by default, and
+    # the macOS PR build enables CMAKE_COMPILE_WARNING_AS_ERROR, which turns
+    # those warnings into hard errors. Keep -Werror for our own sources, but
+    # not for this bundled third-party library.
+    set_target_properties(eb PROPERTIES COMPILE_WARNING_AS_ERROR OFF)
+
+    # `eb` is built with an `@rpath/libeb.dylib` install name. macdeployqt can
+    # only resolve `@rpath/` against Qt's own library directories (the build
+    # tree rpath is stripped on install), so such a dylib never reaches
+    # Contents/Frameworks and epwing support is broken in the packaged app.
+    # Reference it by its absolute build tree path instead, so macdeployqt
+    # bundles it like any other third-party dylib (e.g. the Homebrew ones) and
+    # rewrites the reference to `@executable_path/../Frameworks`.
+    set_target_properties(eb PROPERTIES
+            BUILD_WITH_INSTALL_NAME_DIR ON
+            INSTALL_NAME_DIR "$<TARGET_FILE_DIR:eb>")
+endif ()
+
